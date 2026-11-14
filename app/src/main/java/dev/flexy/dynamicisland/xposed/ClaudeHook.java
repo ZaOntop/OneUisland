@@ -34,7 +34,87 @@ final class ClaudeHook {
             });
         }
         n += hookJson(cl);
+        try {
+            n += hookTls(cl);
+        } catch (Throwable t) {
+            XLog.e("claude tls hook", t);
+        }
         XLog.i("claude hooks: " + n);
+    }
+
+    private static final Set<String> TLS_HOOKED = Collections.synchronizedSet(new HashSet<>());
+
+    // The chat subscription goes through OkHttp, whose classes are renamed, so follow the TLS
+    // stream instead: socket factory -> socket -> input stream, hooking each concrete class once.
+    private static int hookTls(ClassLoader cl) {
+        XC_MethodHook factoryResult = new XC_MethodHook() {
+            @Override
+            protected void afterHookedMethod(MethodHookParam p) {
+                if (p.getResult() != null) hookTlsFactory(p.getResult().getClass());
+            }
+        };
+        int n = Refl.hookAll(javax.net.ssl.SSLContext.class, "getSocketFactory", factoryResult);
+        n += Refl.hookAll(javax.net.ssl.SSLSocketFactory.class, "getDefault", factoryResult);
+        Class<?> conscrypt = Refl.findClass("com.android.org.conscrypt.OpenSSLSocketFactoryImpl", cl);
+        if (conscrypt != null) n += hookTlsFactory(conscrypt);
+        return n;
+    }
+
+    private static int hookFirstConcrete(Class<?> cls, String kind, String name, Class<?>[] params, XC_MethodHook hook) {
+        if (!TLS_HOOKED.add(kind + ":" + cls.getName())) return 0;
+        for (Class<?> c = cls; c != null && c != Object.class; c = c.getSuperclass()) {
+            int n = 0;
+            for (Method m : c.getDeclaredMethods()) {
+                if (!m.getName().equals(name) || java.lang.reflect.Modifier.isAbstract(m.getModifiers())) continue;
+                if (params != null && !java.util.Arrays.equals(m.getParameterTypes(), params)) continue;
+                if (!TLS_HOOKED.add(kind + "#" + m)) continue;
+                XposedBridge.hookMethod(m, hook);
+                n++;
+            }
+            if (n > 0) return n;
+        }
+        return 0;
+    }
+
+    private static int hookTlsFactory(Class<?> factory) {
+        return hookFirstConcrete(factory, "factory", "createSocket", null, new XC_MethodHook() {
+            @Override
+            protected void afterHookedMethod(MethodHookParam p) {
+                try {
+                    if (p.getResult() != null) hookTlsSocket(p.getResult().getClass());
+                } catch (Throwable t) {
+                    XLog.e("claude tls socket", t);
+                }
+            }
+        });
+    }
+
+    private static void hookTlsSocket(Class<?> socket) {
+        hookFirstConcrete(socket, "socket", "getInputStream", new Class<?>[0], new XC_MethodHook() {
+            @Override
+            protected void afterHookedMethod(MethodHookParam p) {
+                try {
+                    if (p.getResult() != null) hookTlsStream(p.getResult().getClass());
+                } catch (Throwable t) {
+                    XLog.e("claude tls stream", t);
+                }
+            }
+        });
+    }
+
+    private static void hookTlsStream(Class<?> stream) {
+        hookFirstConcrete(stream, "stream", "read", new Class<?>[] {byte[].class, int.class, int.class}, new XC_MethodHook() {
+            @Override
+            protected void afterHookedMethod(MethodHookParam p) {
+                try {
+                    if (!(p.getResult() instanceof Integer) || !(p.args[0] instanceof byte[])) return;
+                    int len = (Integer) p.getResult();
+                    if (len > 0) ClaudeConnect.feed(p.thisObject, (byte[]) p.args[0], (Integer) p.args[1], len);
+                } catch (Throwable t) {
+                    XLog.e("claude tls read", t);
+                }
+            }
+        });
     }
 
     private static int hookJson(ClassLoader cl) {

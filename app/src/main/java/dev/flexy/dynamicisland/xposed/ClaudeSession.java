@@ -8,7 +8,45 @@ import java.util.Locale;
 final class ClaudeSession {
     private static final long HISTORY_MS = 90_000;
 
+    private static final int REPLY_IDLE = 0;
+    private static final int REPLY_THINKING = 1;
+    private static final int REPLY_WRITING = 2;
+
+    // Phase of the chat reply from the Connect subscription. Only phase changes reach the island,
+    // and completed messages in the snapshot sent when a conversation is opened don't count as a
+    // finished reply because no reply is in progress then.
+    private static int reply = REPLY_IDLE;
+
     private ClaudeSession() {
+    }
+
+    static synchronized void onReplySent() {
+        replyPhase(REPLY_THINKING);
+    }
+
+    static synchronized void onReplyStatus() {
+        replyPhase(REPLY_THINKING);
+    }
+
+    static synchronized void onReplyText() {
+        replyPhase(REPLY_WRITING);
+    }
+
+    static synchronized void onReplyDone() {
+        if (reply == REPLY_IDLE) return;
+        reply = REPLY_IDLE;
+        AssistantReporter.finished(true);
+    }
+
+    private static void replyPhase(int phase) {
+        if (reply == phase) return;
+        reply = phase;
+        AssistantReporter.working();
+        if (phase == REPLY_WRITING) {
+            AssistantReporter.stage("text", AssistantReporter.label("Writing the answer", "Пишет ответ"));
+        } else {
+            AssistantReporter.stage("think", AssistantReporter.label("Thinking", "Думает"));
+        }
     }
 
     static boolean relevant(String type, boolean hasSession) {
